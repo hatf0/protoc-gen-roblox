@@ -1,3 +1,4 @@
+use anyhow::{bail, Error, Result};
 use bytes::Bytes;
 use itertools::{self, Itertools};
 use protobuf::descriptor::{
@@ -5,63 +6,87 @@ use protobuf::descriptor::{
     OneofDescriptorProto, ServiceDescriptorProto,
 };
 use protobuf::plugin::{code_generator_response, CodeGeneratorRequest, CodeGeneratorResponse};
-use protobuf::Message;
+use protobuf::well_known_types::type_::Enum;
 use protobuf::SpecialFields;
-use std::collections::HashSet;
+use protobuf::{Message, MessageField};
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
+use thiserror::Error;
+
 fn main() {
     let stdin = io::stdin();
+    let mut handle = stdin.lock();
     let mut stdout = io::stdout();
-    let iter = Bytes::from_iter(stdin.bytes().map(|x| x.unwrap_or_default()));
-    while let Ok(request) = CodeGeneratorRequest::parse_from_tokio_bytes(&iter) {
+    let mut stdout_handle = stdout.lock();
+    if let Ok(request) = CodeGeneratorRequest::parse_from_reader(&mut handle) {
         let code_generator = CodeGenerator::new(&request);
         let result = code_generator.generate();
         let bytes = result.write_to_bytes().unwrap();
-        stdout.write(&bytes).unwrap();
+        stdout_handle.write(&bytes).unwrap();
     }
 }
 
-#[derive(Debug)]
-enum CodeGeneratorException {}
+#[derive(Error, Debug)]
+enum CodeGeneratorException {
+    #[error("Unsupported protoc version - expected {expected:}, got {found:}")]
+    UnsupportedProtocVersion { expected: String, found: String },
+}
 
 // thank you, reru!
 struct TypeCollector {
-    seen: HashSet<String>,
-    elements: Vec<DescriptorProto>,
+    elements: HashMap<String, DescriptorProto>,
+    enums: HashMap<String, EnumDescriptorProto>,
 }
 
 impl TypeCollector {
     fn recurse(&mut self, mut descriptor: DescriptorProto, prefix: &str) {
         let absolute_name = format!("{prefix:}.{:}", descriptor.name());
-        if self.seen.contains(&absolute_name) {
+        if self.elements.contains_key(&absolute_name) {
             return;
         }
 
         let children = std::mem::take(&mut descriptor.nested_type);
+        let enums = std::mem::take(&mut descriptor.enum_type);
 
-        self.seen.insert(absolute_name.clone());
-        self.elements.push(descriptor);
+        self.elements.insert(absolute_name.clone(), descriptor);
+
+        for e in enums {
+            let enum_name = format!("{absolute_name:}.{:}", e.name());
+            self.enums.insert(enum_name, e);
+        }
 
         for child in children {
             self.recurse(child, &absolute_name);
         }
     }
 
-    fn run(&mut self, file: FileDescriptorProto, prefix: &str) -> Vec<DescriptorProto> {
-        self.seen.clear();
+    fn run(
+        &mut self,
+        file: FileDescriptorProto,
+        prefix: &str,
+    ) -> (
+        HashMap<String, DescriptorProto>,
+        HashMap<String, EnumDescriptorProto>,
+    ) {
         self.elements.clear();
+        self.enums.clear();
 
         for ty in file.message_type {
             self.recurse(ty, prefix);
         }
 
-        self.elements
+        for en in file.enum_type {
+            let enum_name = format!("{prefix:}.{:}", en.name());
+            self.enums.insert(enum_name, en);
+        }
+
+        (self.elements.to_owned(), self.enums.to_owned())
     }
 
     fn new() -> Self {
         Self {
-            seen: HashSet::new(),
-            elements: Vec::new(),
+            elements: HashMap::new(),
+            enums: HashMap::new(),
         }
     }
 }
@@ -70,23 +95,25 @@ impl TypeCollector {
 struct CodeGenerator<'a> {
     protoc_version: String,
     request: &'a CodeGeneratorRequest,
+    types: HashMap<String, DescriptorProto>,
+    enums: HashMap<String, EnumDescriptorProto>,
 }
 
 impl<'a> CodeGenerator<'a> {
     pub fn new(request: &'a CodeGeneratorRequest) -> Self {
-        let protoc_version = if let Some(compiler_version) = &request.compiler_version.0 {
-            format!(
+        let protoc_version = match &request.compiler_version.0 {
+            Some(compiler_version) => format!(
                 "{:?}{:?}{:?}",
                 compiler_version.major(),
                 compiler_version.minor(),
                 compiler_version.patch()
-            )
-        } else {
-            "".to_string()
+            ),
+            None => "".to_string(),
         };
 
         let mut type_collector = TypeCollector::new();
-        let mut types: Vec<DescriptorProto> = Vec::new();
+        let mut types: HashMap<String, DescriptorProto> = HashMap::new();
+        let mut enums: HashMap<String, EnumDescriptorProto> = HashMap::new();
         for file in &request.proto_file {
             let package_prefix = match &file.package {
                 Some(package) => format!(".{package:}"),
@@ -94,32 +121,32 @@ impl<'a> CodeGenerator<'a> {
             };
 
             // clone is necessary here :-(
-            let file_types = type_collector.run(file.clone(), &package_prefix);
+            let (file_types, enum_types) = type_collector.run(file.clone(), &package_prefix);
             types.extend(file_types);
-        }
-
-        for ty in types {
-            dbg!(ty.name);
+            enums.extend(enum_types);
         }
 
         Self {
             protoc_version,
             request,
+            types,
+            enums,
         }
     }
 
     pub fn generate(&self) -> CodeGeneratorResponse {
-        let files: Result<Vec<code_generator_response::File>, CodeGeneratorException> = self
+        let files: Result<Vec<code_generator_response::File>> = self
             .request
             .proto_file
             .iter()
+            // .filter(|x| x.package() != "google.protobuf")
             .map(|file| self.generate_file(file))
             .try_collect();
 
         match files {
             Err(err) => CodeGeneratorResponse {
-                error: Some(format!("{err:?}")),
-                file: Vec::default(),
+                error: Some(format!("{err:}")),
+                file: Vec::new(),
                 supported_features: None,
                 special_fields: SpecialFields::default(),
             },
@@ -135,7 +162,32 @@ impl<'a> CodeGenerator<'a> {
     pub fn generate_file(
         &self,
         file: &FileDescriptorProto,
-    ) -> Result<code_generator_response::File, CodeGeneratorException> {
-        todo!()
+    ) -> Result<code_generator_response::File> {
+        if file.syntax() != "proto3" {
+            return Err(CodeGeneratorException::UnsupportedProtocVersion {
+                expected: "proto3".to_string(),
+                found: file.syntax().to_string(),
+            }
+            .into());
+        }
+
+        let mut content = String::new();
+        content.push_str("-- Generated by the protocol buffer compiler. DO NOT EDIT!\n");
+        content.push_str(&format!("-- source: {:}\n\n", file.name()));
+        content.push_str("local protobuf = require(\"google/protobuf\")\n\n");
+
+        for dependency in &file.dependency {
+          let dependency_name = dependency.replace(".proto", "");
+          let dependency_import_name = dependency_name.replace("/", "_");
+          content.push_str(&format!("local {dependency_import_name:} = require(\"{:}\")", dependency_name));
+        }
+
+        Ok(code_generator_response::File {
+            name: Some(dbg!(format!("{:}.luau", file.name()))),
+            insertion_point: None,
+            content: Some(content),
+            generated_code_info: MessageField::default(),
+            special_fields: SpecialFields::default(),
+        })
     }
 }
