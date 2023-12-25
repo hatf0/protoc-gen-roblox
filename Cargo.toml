@@ -1,0 +1,15 @@
+[package]
+name = "protoc-gen-roblox"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bytes = "1.5.0"
+itertools = "0.12.0"
+protobuf = { version = "3.3.0", features = ["with-bytes"] }
+
+[build-dependencies]
+protobuf-codegen = "3.3.0"
+protoc-bin-vendored = "3.0.0"
