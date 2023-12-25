@@ -6,12 +6,9 @@ use protobuf::descriptor::{
 };
 use protobuf::plugin::{code_generator_response, CodeGeneratorRequest, CodeGeneratorResponse};
 use protobuf::Message;
-use protobuf::{CodedInputStream, SpecialFields};
-use std::borrow::{Borrow, BorrowMut};
-use std::collections::{HashMap, HashSet};
+use protobuf::SpecialFields;
+use std::collections::HashSet;
 use std::io::{self, Read, Write};
-use std::ops::{Deref, DerefMut};
-use std::rc::Rc;
 fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -26,6 +23,48 @@ fn main() {
 
 #[derive(Debug)]
 enum CodeGeneratorException {}
+
+// thank you, reru!
+struct TypeCollector {
+  seen: HashSet<String>,
+  elements: Vec<DescriptorProto>,
+}
+
+impl TypeCollector {
+  fn recurse(&mut self, mut descriptor: DescriptorProto, prefix: &str) {
+      let absolute_name = format!("{prefix:}.{:}", descriptor.name());
+      if self.seen.contains(&absolute_name) {
+          return;
+      }
+
+      let children = std::mem::take(&mut descriptor.nested_type);
+
+      self.seen.insert(absolute_name.clone());
+      self.elements.push(descriptor);
+
+      for child in children {
+          self.recurse(child, &absolute_name);
+      }
+  }
+
+  fn run(&mut self, file: FileDescriptorProto, prefix: &str) -> &[DescriptorProto] {
+      self.seen.clear();
+      self.elements.clear();
+
+      for ty in file.message_type {
+        self.recurse(ty, prefix);
+      }
+
+      &self.elements
+  }
+
+  fn new() -> Self {
+    Self {
+      seen: HashSet::new(),
+      elements: Vec::new()
+    }
+  }
+}
 
 #[derive(Debug, Default)]
 struct CodeGenerator<'a> {
@@ -46,57 +85,24 @@ impl<'a> CodeGenerator<'a> {
             "".to_string()
         };
 
-        struct TypeCollector<'s> {
-            seen_types: HashMap<String, DescriptorProto>,
-            f: &'s dyn Fn(&mut Box<TypeCollector>, &DescriptorProto, &str) -> Vec<DescriptorProto>,
+        let mut type_collector = TypeCollector::new();
+        let mut types: Vec<DescriptorProto> = Vec::new();
+        for file in &request.proto_file {
+          let package_prefix = if let Some(package) = &file.package {
+              format!(".{package:}")
+          } else {
+              "".to_string()
+          };
+
+          // clone is necessary here :-(
+          let file_types = type_collector.run(file.clone(), &package_prefix);
+          types.extend_from_slice(file_types)
         }
 
-        let mut collector = Box::new(TypeCollector {
-            seen_types: HashMap::new(),
-            f: &|collector: &mut Box<TypeCollector>,
-                 message_type: &DescriptorProto,
-                 prefix: &str| {
-                let absolute_name = format!("{prefix:}.{:}", message_type.name());
-                if collector.seen_types.contains_key(&absolute_name) {
-                    Vec::default()
-                } else {
-                    {
-                        let collector_mut = collector.deref_mut();
-                        collector_mut
-                            .seen_types
-                            .insert(absolute_name.clone(), message_type.clone());
-                        dbg!(&absolute_name);
-                    }
-
-                    let mut ret: Vec<DescriptorProto> = message_type
-                        .nested_type
-                        .iter()
-                        .flat_map(|x| (collector.f)(collector, x, &absolute_name))
-                        .collect();
-                    ret.push(message_type.clone());
-                    ret
-                }
-            },
-        });
-
-        let types = request
-            .proto_file
-            .iter()
-            .flat_map(move |x| {
-                let package_prefix = if let Some(package) = &x.package {
-                    format!(".{package:}")
-                } else {
-                    "".to_string()
-                };
-                x.message_type
-                    .iter()
-                    .flat_map(|ty| (&collector.f.clone())(&mut collector, ty, &package_prefix))
-                    .collect::<Vec<DescriptorProto>>()
-            })
-            .collect::<Vec<DescriptorProto>>();
         for ty in types {
-            dbg!(ty.name);
+          dbg!(ty.name);
         }
+
         Self {
             protoc_version,
             request,
